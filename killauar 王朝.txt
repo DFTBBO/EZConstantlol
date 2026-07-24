@@ -1,0 +1,199 @@
+--[[
+    杀戮光环 (Kill Aura) 脚本
+    适配：手机端 / PC端
+    放置位置：StarterPlayerScripts 或 StarterGui (作为 LocalScript)
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- ================= 配置变量 =================
+local AuraEnabled = false       -- 光环开关
+local lastAttackTime = 0        -- 上次攻击时间
+local attackCooldown = 0.1      -- 攻击间隔 (0.3~0.5秒之间，模拟正常攻速)
+local attackRadius = 35         -- 攻击范围半径 (格)
+
+-- ================= UI 创建 =================
+-- 创建主 ScreenGui
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "KillAuraGui"
+screenGui.ResetOnSpawn = false  -- 死亡不重置
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent = PlayerGui
+
+-- 范围提示 Label
+local rangeLabel = Instance.new("TextLabel")
+rangeLabel.Size = UDim2.new(0.18, 0, 0.05, 0)
+rangeLabel.Position = UDim2.new(0.8, 0, 0.70, 0)
+rangeLabel.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+rangeLabel.BackgroundTransparency = 0.3
+rangeLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+rangeLabel.Text = "范围：" .. attackRadius
+rangeLabel.TextScaled = true
+rangeLabel.Font = Enum.Font.SourceSansBold
+rangeLabel.BorderSizePixel = 0
+rangeLabel.ZIndex = 10
+rangeLabel.Parent = screenGui
+
+local uiCornerLabel = Instance.new("UICorner")
+uiCornerLabel.CornerRadius = UDim.new(0.2, 0)
+uiCornerLabel.Parent = rangeLabel
+
+-- 开关 Button
+local toggleButton = Instance.new("TextButton")
+toggleButton.Size = UDim2.new(0.18, 0, 0.1, 0)
+toggleButton.Position = UDim2.new(0.8, 0, 0.75, 0)
+toggleButton.BackgroundColor3 = Color3.fromRGB(120, 120, 120) -- 默认灰色
+toggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggleButton.Text = "杀戮光环：关"
+toggleButton.TextScaled = true
+toggleButton.Font = Enum.Font.SourceSansBold
+toggleButton.BorderSizePixel = 0
+toggleButton.AutoButtonColor = false
+toggleButton.Active = true      -- 拦截触控，防止穿透到游戏角色移动
+toggleButton.ZIndex = 10
+toggleButton.Parent = screenGui
+
+local uiCornerBtn = Instance.new("UICorner")
+uiCornerBtn.CornerRadius = UDim.new(0.2, 0)
+uiCornerBtn.Parent = toggleButton
+
+-- 保持宽高比，避免不同手机屏幕拉伸变形
+local aspectRatio = Instance.new("UIAspectRatioConstraint")
+aspectRatio.AspectRatio = 1.8   -- 0.18 / 0.1 = 1.8
+aspectRatio.Parent = toggleButton
+
+-- UI 点击事件
+toggleButton.MouseButton1Click:Connect(function()
+    AuraEnabled = not AuraEnabled
+    if AuraEnabled then
+        toggleButton.Text = "杀戮光环：开"
+        toggleButton.BackgroundColor3 = Color3.fromRGB(46, 204, 113) -- 亮绿色
+    else
+        toggleButton.Text = "杀戮光环：关"
+        toggleButton.BackgroundColor3 = Color3.fromRGB(120, 120, 120) -- 灰色
+    end
+end)
+
+
+-- ================= 核心逻辑函数 =================
+
+-- 1. 动态获取敌人文件夹 (防止地图/回合重置导致引用失效)
+local function getEnemiesFolder()
+    local gameFolder = workspace:FindFirstChild("Game")
+    if not gameFolder then return nil end
+    local current = gameFolder:FindFirstChild("Current")
+    if not current then return nil end
+    local spawned = current:FindFirstChild("Spawned")
+    if not spawned then return nil end
+    local npcs = spawned:FindFirstChild("NPCs")
+    if not npcs then return nil end
+    return npcs:FindFirstChild("enemies")
+end
+
+-- 2. 获取近战武器的事件 (每次攻击前获取，防死亡/换武器报错)
+local function getRegisterHitEvent()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local melee = char:FindFirstChild("melee")
+    if not melee then return nil end
+    local serverEvents = melee:FindFirstChild("ServerEvents")
+    if not serverEvents then return nil end
+    return serverEvents:FindFirstChild("RegisterHit")
+end
+
+-- 3. 扫描并获取最近的有效目标
+local function findNearestEnemy()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local myHRP = char:FindFirstChild("HumanoidRootPart")
+    if not myHRP then return nil end
+    
+    local enemiesFolder = getEnemiesFolder()
+    if not enemiesFolder then return nil end
+    
+    local nearestEnemy = nil
+    local shortestDist = attackRadius
+    
+    for _, enemy in ipairs(enemiesFolder:GetChildren()) do
+        if enemy:IsA("Model") then
+            local hum = enemy:FindFirstChildOfClass("Humanoid")
+            local hrp = enemy:FindFirstChild("HumanoidRootPart")
+            local head = enemy:FindFirstChild("Head")
+            
+            -- 筛选条件：有Humanoid且存活，有根部件和头部
+            if hum and hrp and head and hum.Health > 0 then
+                local dist = (hrp.Position - myHRP.Position).Magnitude
+                if dist <= shortestDist then
+                    shortestDist = dist
+                    nearestEnemy = enemy
+                end
+            end
+        end
+    end
+    
+    return nearestEnemy
+end
+
+
+-- ================= 事件参数模板预构建 =================
+-- 提前构建好表结构，避免在循环内频繁创建表导致手机内存分配和GC卡顿
+local hitData = {
+    amount = 1,
+    target = nil,
+    is_friendly = false,
+    part = nil,
+    cast_results = nil
+}
+local arg1 = { hitData } -- 索引1：包含攻击信息的数组
+local arg2 = {}          -- 索引2：空表
+-- 索引3：nil (隐式)
+local arg4 = true        -- 索引4：布尔值
+local arg5 = false       -- 索引5：布尔值
+
+
+-- ================= 主循环 =================
+task.spawn(function()
+    while true do
+        if AuraEnabled then
+            local event = getRegisterHitEvent()
+            -- 确保事件存在且为 RemoteEvent
+            if event and event:IsA("RemoteEvent") then
+                local targetEnemy = findNearestEnemy()
+                
+                if targetEnemy then
+                    local char = LocalPlayer.Character
+                    local myHRP = char and char:FindFirstChild("HumanoidRootPart")
+                    local targetHRP = targetEnemy:FindFirstChild("HumanoidRootPart")
+                    local targetHead = targetEnemy:FindFirstChild("Head")
+                    
+                    if myHRP and targetHRP and targetHead then
+                        -- 【1】平滑转向目标 (锁定Y轴，防止角色上下倾斜抽搐)
+                        local lookAtPos = Vector3.new(targetHRP.Position.X, myHRP.Position.Y, targetHRP.Position.Z)
+                        myHRP.CFrame = CFrame.lookAt(myHRP.Position, lookAtPos)
+                        
+                        -- 【2】冷却判断与发包
+                        local currentTime = tick()
+                        if currentTime - lastAttackTime >= attackCooldown then
+                            -- 仅更新引用，不重新创建表
+                            hitData.target = targetEnemy
+                            hitData.part = targetHead
+                            
+                            -- 使用 pcall 防止敌人瞬间死亡/消失导致报错中断循环
+                            -- 显式传参完美避开 unpack 遇到 nil 空洞截断的问题
+                            pcall(function()
+                                event:FireServer(arg1, arg2, nil, arg4, arg5)
+                            end)
+                            
+                            lastAttackTime = currentTime
+                        end
+                    end
+                end
+            end
+        end
+        -- 短等待，减轻手机端 CPU 性能压力
+        task.wait(0) 
+    end
+end)
