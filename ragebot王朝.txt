@@ -1,0 +1,276 @@
+-- // Ragebot Ultimate Script
+-- // 适用于 Roblox 执行器，使用标准 Luau 编写
+-- // 包含 Ragebot, Inf Wallbang, Bullet TP, 自动秒换弹, 精美UI
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+
+local localPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+-- // 兼容自定义 vector 模块
+local function createVector(x, y, z)
+    if vector and vector.create then
+        return vector.create(x, y, z)
+    end
+    return Vector3.new(x, y, z)
+end
+
+-- // 状态与配置
+local Config = {
+    Ragebot = false,
+    Wallbang = false,
+    BulletTP = false,
+    AutoReload = false,
+    WallCheck = true,
+    TeamCheck = true,
+    FireRate = 0.01,
+    MaxDistance = 4500,
+    AmmoCount = 30,
+    MaxAmmo = 30
+}
+
+local activeSounds = {}
+local RemoteEvents = nil
+
+-- // 获取 RemoteEvents
+local function updateRemotes()
+    if localPlayer.Character then
+        local primary = localPlayer.Character:FindFirstChild("primary")
+        if primary then
+            RemoteEvents = primary:FindFirstChild("ServerEvents")
+        end
+    end
+end
+
+-- // 死亡重置与角色加载
+localPlayer.CharacterAdded:Connect(function(char)
+    Config.Ragebot = false
+    Config.Wallbang = false
+    Config.BulletTP = false
+    Config.AutoReload = false
+    Config.AmmoCount = Config.MaxAmmo
+    RemoteEvents = nil
+    task.wait(1)
+    updateRemotes()
+end)
+
+if localPlayer.Character then
+    updateRemotes()
+end
+
+-- // 目标获取与过滤 (优先无掩体，其次最近)
+local function getBestTarget()
+    local char = localPlayer.Character
+    if not char then return nil end
+    local playerPos = char:FindFirstChild("HumanoidRootPart")
+    if not playerPos then return nil end
+
+    local bestTargetLOS = nil
+    local bestDistLOS = Config.MaxDistance
+    local bestTargetNoLOS = nil
+    local bestDistNoLOS = Config.MaxDistance
+
+    for _, desc in ipairs(Workspace:GetDescendants()) do
+        if desc:IsA("Humanoid") and desc.Health > 0 then
+            local model = desc.Parent
+            if model and model ~= char and not Players:GetPlayerFromCharacter(model) then
+                local root = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso")
+                if root then
+                    local dist = (root.Position - playerPos.Position).Magnitude
+                    if dist <= Config.MaxDistance then
+                        -- 友军检测
+                        local isFriendly = false
+                        if Config.TeamCheck then
+                            if model:FindFirstChild("is_friendly") and model.is_friendly.Value == true then
+                                isFriendly = true
+                            elseif localPlayer.Team and model:FindFirstChild("Team") and model.Team.Value == localPlayer.Team then
+                                isFriendly = true
+                            end
+                        end
+                        
+                        if not isFriendly then
+                            local rayParams = RaycastParams.new()
+                            rayParams.FilterType = Enum.RaycastFilterType.Exclude
+                            rayParams.FilterDescendantsInstances = {char, model}
+                            
+                            local hasLOS = true
+                            if Config.WallCheck then
+                                local result = Workspace:Raycast(playerPos.Position, root.Position - playerPos.Position, rayParams)
+                                hasLOS = not result or result.Instance:IsDescendantOf(model)
+                            end
+                            
+                            if hasLOS then
+                                if dist < bestDistLOS then
+                                    bestDistLOS = dist
+                                    bestTargetLOS = {Model = model, Root = root, Dist = dist}
+                                end
+                            else
+                                if dist < bestDistNoLOS then
+                                    bestDistNoLOS = dist
+                                    bestTargetNoLOS = {Model = model, Root = root, Dist = dist}
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return bestTargetLOS or bestTargetNoLOS
+end
+
+-- // Inf Wallbang 逻辑 (更改射击位置)
+local function findWallbangPoint(origin, targetModel, targetPos)
+    local ignoreList = {localPlayer.Character, targetModel}
+    
+    -- 1. 优先尝试头上左右近距离空余位置
+    local closeOffsets = {
+        createVector(0, 5, 0),
+        createVector(3, 3, 0),
+        createVector(-3, 3, 0),
+        createVector(0, 3, 3),
+        createVector(0, 3, -3)
+    }
+    for _, offset in ipairs(closeOffsets) do
+        local testOrigin = origin + offset
+        local direction = targetPos - testOrigin
+        local rayParams = RaycastParams.new()
+        rayParams.FilterType = Enum.RaycastFilterType.Exclude
+        rayParams.FilterDescendantsInstances = ignoreList
+        local result = Workspace:Raycast(testOrigin, direction, rayParams)
+        if not result or result.Instance:IsDescendantOf(targetModel) then
+            return testOrigin, result
+        end
+    end
+    
+    -- 2. 如果近距离不行，尝试 250米内随机位置
+    for i = 1, 15 do
+        local randomOffset = createVector(math.random(-250, 250), math.random(0, 50), math.random(-250, 250))
+        local testOrigin = origin + randomOffset
+        local direction = targetPos - testOrigin
+        local rayParams = RaycastParams.new()
+        rayParams.FilterType = Enum.RaycastFilterType.Exclude
+        rayParams.FilterDescendantsInstances = ignoreList
+        local result = Workspace:Raycast(testOrigin, direction, rayParams)
+        if not result or result.Instance:IsDescendantOf(targetModel) then
+            return testOrigin, result
+        end
+    end
+    return nil, nil
+end
+
+-- // 紫色射线视觉效果 (DNA纹理, 0.3秒消失, 微微抖动)
+local function createBeam(startPos, endPos)
+    local part1 = Instance.new("Part")
+    part1.Anchored = true
+    part1.CanCollide = false
+    part1.Transparency = 1
+    part1.Size = createVector(0.1, 0.1, 0.1)
+    part1.Position = startPos
+    
+    local part2 = part1:Clone()
+    part2.Position = endPos
+    
+    local att1 = Instance.new("Attachment", part1)
+    local att2 = Instance.new("Attachment", part2)
+    
+    local beam = Instance.new("Beam")
+    beam.Attachment0 = att1
+    beam.Attachment1 = att2
+    beam.Texture = "rbxassetid://7071778278"
+    beam.TextureLength = 12
+    beam.TextureMode = Enum.TextureMode.Wrap
+    beam.TextureSpeed = 1
+    beam.Width0 = 0.6
+    beam.Width1 = 0.6
+    beam.FaceCamera = true
+    beam.LightEmission = 1
+    beam.LightInfluence = 0
+    beam.Brightness = 1.5
+    beam.Color = ColorSequence.new(Color3.fromRGB(170, 0, 255)) -- 紫色
+    beam.Transparency = NumberSequence.new(0.45)
+    beam.Parent = part1
+    
+    part1.Parent = Camera
+    part2.Parent = Camera
+    
+    -- 微微抖动
+    local runConn
+    runConn = RunService.RenderStepped:Connect(function()
+        if not beam.Parent then runConn:Disconnect() return end
+        att1.Position = createVector(math.random(-5,5)/100, math.random(-5,5)/100, math.random(-5,5)/100)
+    end)
+    
+    -- 严格 0.3秒后渐渐消失
+    task.delay(0.07, function()
+        if beam and beam.Parent then
+            local tween = TweenService:Create(beam, TweenInfo.new(0.1), {Transparency = NumberSequence.new(1)})
+            tween:Play()
+            tween.Completed:Wait()
+            if part1 then part1:Destroy() end
+            if part2 then part2:Destroy() end
+            runConn:Disconnect()
+        end
+    end)
+end
+
+-- // Hit Sound 播放 (最高重叠2个)
+local function playHitSound()
+    for i = #activeSounds, 1, -1 do
+        if not activeSounds[i].IsPlaying then
+            activeSounds[i]:Destroy()
+            table.remove(activeSounds, i)
+        end
+    end
+    
+    if #activeSounds < 4 then
+        local sound = Instance.new("Sound")
+        sound.SoundId = "rbxassetid://6534948092"
+        sound.Volume = 10
+        sound.Parent = Camera
+        sound:Play()
+        table.insert(activeSounds, sound)
+        sound.Ended:Connect(function()
+            sound:Destroy()
+        end)
+    end
+end
+
+-- // 主射击循环
+task.spawn(function()
+    while task.wait(Config.FireRate) do
+        if Config.Ragebot and localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart") then
+            updateRemotes()
+            local tool = localPlayer.Character:FindFirstChildOfClass("Tool")
+            
+            if tool and RemoteEvents then
+                local targetData = getBestTarget()
+                if targetData then
+                    local targetModel = targetData.Model
+                    local targetRoot = targetData.Root
+                    local playerPos = localPlayer.Character.HumanoidRootPart.Position
+                    
+                    local shootOrigin = playerPos
+                    local rayParams = RaycastParams.new()
+                    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+                    rayParams.FilterDescendantsInstances = {localPlayer.Character, targetModel}
+                    
+                    local direction = targetRoot.Position - shootOrigin
+                    local result = Workspace:Raycast(shootOrigin, direction, rayParams)
+                    
+                    -- Inf Wallbang 逻辑
+                    if Config.Wallbang and result and not result.Instance:IsDescendantOf(targetModel) then
+                        local wbOrigin, wbResult = findWallbangPoint(playerPos, targetModel, targetRoot.Position)
+                        if wbOrigin then
+                            shootOrigin = wbOrigin
+                            result = wbResult
+                        end
+                    end
+                    
+                    -- Bullet TP 逻辑 (无视地形直接命中)
+                    if Config.BulletTP then
+                 
